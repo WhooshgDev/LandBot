@@ -111,14 +111,4 @@ def main():
 
 
 if __name__ == "__main__":
-    #main()
-    project_root = Path(__file__).resolve().parent.parent.parent
-
-    output_path = project_root / "data" / "legal_nodes.parquet"
-
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    df = pd.read_parquet(output_path)
-    with pd.option_context('display.max_colwidth', None):
-        for col in df.columns:
-            print(f"Column: {col}")
-            print(df[col].head(5))
+    main()
