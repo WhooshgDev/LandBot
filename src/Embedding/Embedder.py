@@ -21,6 +21,35 @@ CHECKPOINT_DIR = PROJECT_ROOT / "data" / "checkpoints"
 DATA_PATH = PROJECT_ROOT / "data" / "LandLawDocumentCleaned.parquet"
 NUM_GPUS = torch.cuda.device_count() if torch.cuda.is_available() else 0
 
+EMBEDDING_TEXT_COLUMNS = [
+    "document_number",
+    "legal_type",
+    "title",
+    "article",
+    "clause",
+    "point",
+    "content",
+]
+
+
+def safe_text(value) -> str:
+    if value is None or pd.isna(value):
+        return ""
+    return str(value).strip()
+
+
+def build_embedding_text(row: pd.Series) -> str:
+    parts = [
+        safe_text(row.get("document_number")),
+        safe_text(row.get("legal_type")),
+        safe_text(row.get("title")),
+        f"Điều {safe_text(row.get('article'))}" if safe_text(row.get("article")) else "",
+        f"Khoản {safe_text(row.get('clause'))}" if safe_text(row.get("clause")) else "",
+        f"Điểm {safe_text(row.get('point'))}" if safe_text(row.get("point")) else "",
+        safe_text(row.get("content")),
+    ]
+    return " ".join(part for part in parts if part)
+
 print(f"GPUs: {NUM_GPUS}")
 for i in range(NUM_GPUS):
     vram = torch.cuda.get_device_properties(i).total_memory / 1e9
@@ -29,9 +58,9 @@ for i in range(NUM_GPUS):
 # Load data
 df = pd.read_parquet(DATA_PATH)
 print(f"Loaded {len(df):,} chunks")
-content = df["content"].fillna("").tolist()
+content = df.apply(build_embedding_text, axis=1).tolist()
 ids = df["chunk_id"].tolist()
-metadata = df.drop(columns=["content"]).to_dict(orient="records")
+metadata = df.to_dict(orient="records")
 
 # Load model(s)
 tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
@@ -115,6 +144,10 @@ with open(os.path.join(VECTOR_STORE_DIR, "config.json"), "w") as f:
         "index_type": "IndexFlatIP (cosine)",
         "normalized": True,
         "max_seq_length": MAX_SEQ_LEN,
+        "embedding_text_columns": EMBEDDING_TEXT_COLUMNS,
+        "embedding_text_version": "metadata_plus_content_v1",
+        "data_path": str(DATA_PATH),
+        "data_rows": len(ids),
     }, f, indent=2)
 
 for f in os.listdir(CHECKPOINT_DIR):

@@ -6,7 +6,7 @@ from typing import Any, Dict, Sequence
 from Searcher.HybridSearch import hybrid_search
 
 
-TRIAL_QUERY = "Điều kiện cấp giấy chứng nhận quyền sử dụng đất là gì?"
+TRIAL_QUERY = "Quy định về thu hồi đất và xử lý quyền lợi, nghĩa vụ của người sử dụng đất khi Nhà nước thu hồi đất là gì?"
 
 
 def safe_preview(value: Any, limit: int = 260) -> str:
@@ -17,25 +17,26 @@ def safe_preview(value: Any, limit: int = 260) -> str:
     return text[: limit - 3] + "..."
 
 
+def format_score(value, digits=4):
+    if value is None:
+        return "N/A"
+    try:
+        return f"{float(value):.{digits}f}"
+    except (TypeError, ValueError):
+        return "N/A"
+
+
 def print_results(results: Sequence[Dict[str, Any]]) -> None:
     for result in results:
         print("-" * 100)
         print(f"Rank: {result.get('rank')}")
         print(f"Chunk ID: {result.get('chunk_id')}")
-        print(f"Score: {result.get('score', 0.0):.4f}")
-        print(f"BM25: {result.get('bm25_score', 0.0):.4f}")
-        print(f"Vector: {result.get('vector_score', 0.0):.4f}")
-        print(f"Graph: {result.get('graph_score', 0.0):.4f}")
-        if result.get("graph_penalty"):
-            print(f"Graph penalty: {result.get('graph_penalty', 0.0):.4f}")
-        if result.get("legal_update_warning"):
-            print(f"Legal update warning: {result.get('legal_update_warning')}")
-        if result.get("graph_relations"):
-            relation_preview = [
-                f"{rel.get('direction')}:{rel.get('relation_type')}:{rel.get('seed_doc_id')}"
-                for rel in result.get("graph_relations", [])[:3]
-            ]
-            print(f"Graph relations: {relation_preview}")
+        print(f"Fused score: {format_score(result.get('score', 0.0))}")
+        print(f"BM25 raw: {format_score(result.get('bm25_raw_score'))}")
+        print(f"BM25 rank: {result.get('bm25_rank')}")
+        print(f"Vector raw: {format_score(result.get('vector_raw_score'))}")
+        print(f"Vector rank: {result.get('vector_rank')}")
+        print(f"RRF: {format_score(result.get('fusion_score', result.get('final_score', 0.0)))}")        
         print(f"Title: {safe_preview(result.get('title'), 180)}")
         print(f"Content: {safe_preview(result.get('content'))}")
 
@@ -46,7 +47,8 @@ def main() -> None:
     print()
 
     start = time.time()
-    results = hybrid_search(TRIAL_QUERY, top_k=5, pool_k=20, alpha=0.4)
+    results = hybrid_search(TRIAL_QUERY, top_k=5, alpha=0.4)
+    
     runtime = time.time() - start
 
     print(f"Runtime: {runtime:.2f} seconds")

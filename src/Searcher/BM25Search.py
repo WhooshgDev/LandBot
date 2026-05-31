@@ -8,10 +8,8 @@ import gc
 import json
 import os
 import pickle
-import re
 import sys
 import time
-import unicodedata
 
 import numpy as np
 import pandas as pd
@@ -50,12 +48,8 @@ TOKENIZER_NAME = "pyvi"  # options: "pyvi", "simple"
 TOKEN_CACHE_PATH = CACHE_DIR / f"bm25_tokenized_{TOKENIZER_NAME}.pkl"
 BM25_INDEX_CACHE_PATH = CACHE_DIR / f"bm25_index_{TOKENIZER_NAME}.pkl"
 
-# Nên lấy candidate rộng hơn top-10 để reranker có cơ hội tìm đúng hơn.
 BM25_TOP_N = 100
 FINAL_TOP_K = 10
-
-# Query expansion dùng cho BM25 để tăng recall.
-USE_QUERY_EXPANSION = True
 
 def safe_str(value: Any) -> str:
     """Convert any value to a clean string. Treat None/NaN as empty."""
@@ -69,75 +63,13 @@ def safe_str(value: Any) -> str:
     return str(value)
 
 
-def normalize_text(text: Any) -> str:
-    """Normalize Vietnamese text for rule-based matching."""
-    text = safe_str(text).lower()
-    text = unicodedata.normalize("NFD", text)
-    text = "".join(char for char in text if unicodedata.category(char) != "Mn")
-    text = text.replace("đ", "d")
-    text = re.sub(r"\s+", " ", text).strip()
-    return text
-
-
-def looks_like_certificate_condition_query(query: str) -> bool:
-    q = normalize_text(query)
-    has_certificate = any(term in q for term in ["giay chung nhan", "so do", "gcn"])
-    has_land = "dat" in q or "quyen su dung dat" in q
-    has_intent = any(term in q for term in ["dieu kien", "duoc cap", "du dieu kien", "cap", "lam"])
-    return has_certificate and has_land and has_intent
-
-
-def expand_query_for_bm25(query: str) -> str:
-    """Expand common legal queries to improve BM25 recall.
-
-    Only used for BM25 retrieval. Cross-Encoder reranker still receives the original query.
-    """
-    if not USE_QUERY_EXPANSION:
-        return query
-
-    q = normalize_text(query)
-
-    if looks_like_certificate_condition_query(query):
-        expansion = " ".join([
-            query,
-            "cấp Giấy chứng nhận quyền sử dụng đất",
-            "điều kiện cấp Giấy chứng nhận",
-            "đủ điều kiện được cấp Giấy chứng nhận",
-            "hộ gia đình cá nhân đang sử dụng đất",
-            "có giấy tờ về quyền sử dụng đất",
-            "không có giấy tờ về quyền sử dụng đất",
-            "sử dụng đất ổn định",
-            "không có tranh chấp",
-            "phù hợp quy hoạch",
-            "Luật Đất đai",
-            "Điều 100 Điều 101 Điều 137 Điều 138",
-            "sổ đỏ",
-        ])
-        return expansion
-
-    if any(term in q for term in ["boi thuong", "thu hoi dat", "tai dinh cu"]):
-        return " ".join([query, "bồi thường khi Nhà nước thu hồi đất hỗ trợ tái định cư điều kiện được bồi thường"])
-
-    return query
-
-
 def preview_results(results: Sequence[Dict[str, Any]], max_content_chars: int = 450) -> None:
-    """Pretty print retrieval/reranking results."""
+    """Pretty print BM25 retrieval results."""
     for item in results:
-        rank = item.get("rerank_rank", item.get("rank"))
-        print("Rank:", rank)
+        print("Rank:", item.get("rank"))
         print("Chunk ID:", item.get("chunk_id"))
         print("Title:", item.get("title"))
-
-        for key in [
-            "bm25_score", "bm25_norm_score", "rerank_raw_score", "rerank_norm_score",
-            "base_score", "locality_penalty", "off_intent_penalty",
-            "certificate_intent_penalty", "legal_type_priority", "direct_answer_boost",
-            "locality_boost", "final_score", "relative_final_score",
-        ]:
-            if key in item:
-                print(f"{key}:", item.get(key))
-
+        print("BM25 score:", item.get("bm25_score", item.get("score")))
         print("Content:", safe_str(item.get("content"))[:max_content_chars])
         print("-" * 100)
 
@@ -161,7 +93,7 @@ def load_chunks(data_path: Path) -> List[Dict[str, Any]]:
         raise ValueError(f"Unsupported file type: {suffix}")
 
     if "content" not in df.columns:
-        raise ValueError("Data phải có cột 'content' để BM25 và reranker hoạt động.")
+        raise ValueError("Data phải có cột 'content' để BM25 hoạt động.")
 
     if "chunk_id" not in df.columns:
         df = df.copy()
@@ -281,7 +213,7 @@ class BM25Retriever:
     BM25 is used as first-stage retrieval:
         query -> top-N candidate chunks
 
-    Then CrossEncoderLegalReranker reranks only those top-N candidates.
+    Higher-level rerankers can adjust the returned candidates after retrieval.
     """
 
     def __init__(
@@ -468,13 +400,10 @@ class BM25Retriever:
             json.dump(self._current_cache_metadata(), f, ensure_ascii=False, indent=2)
         tmp_metadata_path.replace(metadata_path)
 
-    def search(self, query: str, top_n: int = 100, expand_query: bool = False) -> List[Dict[str, Any]]:
+    def search(self, query: str, top_n: int = 100) -> List[Dict[str, Any]]:
         """Return top-N BM25 candidates."""
         if not self.chunks or top_n <= 0:
             return []
-
-        if expand_query:
-            query = expand_query_for_bm25(query)
 
         tokenized_query = self.tokenize(query)
         if not tokenized_query:
@@ -499,177 +428,7 @@ class BM25Retriever:
         return results
 
     def __call__(self, query: str, top_k: int = 100) -> List[Dict[str, Any]]:
-        return self.search(query, top_n=top_k, expand_query=True)
-
-VIETNAM_PROVINCES = [
-    "Hà Nội", "TP.HCM", "Thành phố Hồ Chí Minh", "Hồ Chí Minh",
-    "Đà Nẵng", "Hải Phòng", "Cần Thơ",
-    "Đồng Tháp", "Ninh Thuận", "Quảng Nam", "Bình Dương",
-    "Thừa Thiên Huế", "Lâm Đồng", "Đồng Nai", "Long An",
-    "Tiền Giang", "Bến Tre", "Trà Vinh", "Vĩnh Long",
-    "An Giang", "Kiên Giang", "Hậu Giang", "Sóc Trăng",
-    "Bạc Liêu", "Cà Mau", "Tây Ninh", "Bình Phước",
-    "Bà Rịa", "Vũng Tàu", "Bình Thuận", "Khánh Hòa",
-    "Phú Yên", "Bình Định", "Quảng Ngãi", "Quảng Trị",
-    "Quảng Bình", "Hà Tĩnh", "Nghệ An", "Thanh Hóa",
-    "Nam Định", "Ninh Bình", "Thái Bình", "Hưng Yên",
-    "Hải Dương", "Bắc Ninh", "Bắc Giang", "Vĩnh Phúc",
-    "Phú Thọ", "Thái Nguyên", "Lạng Sơn", "Cao Bằng",
-    "Bắc Kạn", "Hà Giang", "Tuyên Quang", "Yên Bái",
-    "Lào Cai", "Sơn La", "Điện Biên", "Lai Châu",
-    "Hòa Bình", "Gia Lai", "Kon Tum", "Đắk Lắk", "Đắk Nông",
-]
-
-NORMALIZED_PROVINCES = [normalize_text(p) for p in VIETNAM_PROVINCES]
-
-
-def query_mentions_locality(query: str) -> bool:
-    q = normalize_text(query)
-    if any(province in q for province in NORMALIZED_PROVINCES):
-        return True
-    locality_markers = [
-        "tren dia ban", "dia ban", "ubnd", "uy ban nhan dan",
-        "hoi dong nhan dan", "hdnd", "tinh ", "thanh pho ", "tp ",
-    ]
-    return any(marker in q for marker in locality_markers)
-
-
-def get_query_localities(query: str) -> List[str]:
-    q = normalize_text(query)
-    return [province for province in NORMALIZED_PROVINCES if province in q]
-
-
-def is_local_legal_document(chunk: Dict[str, Any]) -> bool:
-    combined = normalize_text(
-        f"{chunk.get('title', '')} {chunk.get('legal_type', '')} {chunk.get('document_number', '')}"
-    )
-    local_markers = [
-        "ubnd", "qd-ubnd", "qđ-ubnd", "uy ban nhan dan", "hoi dong nhan dan", "hdnd",
-        "tren dia ban", "dia ban tinh", "dia ban thanh pho", "dia ban tp",
-    ]
-    if any(marker in combined for marker in local_markers):
-        return True
-    if any(province in combined for province in NORMALIZED_PROVINCES):
-        return True
-    return False
-
-
-def locality_penalty_factor(query: str, chunk: Dict[str, Any]) -> float:
-    if not query_mentions_locality(query) and is_local_legal_document(chunk):
-        return 0.55
-    return 1.0
-
-
-def locality_boost_factor(query: str, chunk: Dict[str, Any]) -> float:
-    query_localities = get_query_localities(query)
-    if not query_localities:
-        return 1.0
-    combined = normalize_text(
-        f"{chunk.get('title', '')} {chunk.get('legal_type', '')} {chunk.get('document_number', '')}"
-    )
-    if any(locality in combined for locality in query_localities):
-        return 1.15
-    return 1.0
-
-
-def off_intent_penalty_factor(query: str, chunk: Dict[str, Any]) -> float:
-    q = normalize_text(query)
-    title = normalize_text(chunk.get("title"))
-    content = normalize_text(chunk.get("content"))
-
-    off_intent_terms = ["boi thuong", "ho tro", "tai dinh cu", "thu hoi dat"]
-    query_mentions_off_intent = any(term in q for term in off_intent_terms)
-    title_mentions_off_intent = any(term in title for term in off_intent_terms)
-    content_mentions_many = sum(term in content for term in off_intent_terms) >= 2
-
-    if not query_mentions_off_intent and title_mentions_off_intent:
-        return 0.65
-    if not query_mentions_off_intent and content_mentions_many:
-        return 0.80
-    return 1.0
-
-
-def general_certificate_query(query: str) -> bool:
-    return looks_like_certificate_condition_query(query)
-
-
-def certificate_intent_penalty_factor(query: str, chunk: Dict[str, Any]) -> float:
-    if not general_certificate_query(query):
-        return 1.0
-
-    combined = normalize_text(
-        f"{chunk.get('title', '')} {chunk.get('legal_type', '')} {chunk.get('content', '')}"
-    )
-
-    strong_bad_terms = [
-        "phi tham dinh", "thu tien su dung dat", "tien su dung dat",
-        "du an", "vilg", "bao cao ket qua", "tang cho",
-        "nha tinh nghia", "nha tinh thuong", "nha dai doan ket", "cong van",
-    ]
-    medium_bad_terms = [
-        "ho so dia chinh", "mau giay chung nhan", "ghi tren giay chung nhan",
-        "cap doi", "cap lai", "dang ky bien dong", "chinh ly",
-        "thua dat da duoc cap giay chung nhan",
-    ]
-
-    if any(term in combined for term in strong_bad_terms):
-        return 0.45
-    if any(term in combined for term in medium_bad_terms):
-        return 0.65
-    return 1.0
-
-
-def direct_answer_boost_factor(query: str, chunk: Dict[str, Any]) -> float:
-    if not general_certificate_query(query):
-        return 1.0
-
-    combined = normalize_text(
-        f"{chunk.get('title', '')} {chunk.get('content', '')}"
-    )
-
-    positive_terms = [
-        "du dieu kien duoc cap giay chung nhan",
-        "du dieu kien cap giay chung nhan",
-        "duoc cap giay chung nhan",
-        "co giay to ve quyen su dung dat",
-        "khong co giay to ve quyen su dung dat",
-        "su dung dat on dinh",
-        "khong co tranh chap",
-        "phu hop voi quy hoach",
-        "nguon goc va thoi diem su dung dat",
-        "dieu kien cap giay chung nhan",
-    ]
-
-    hit_count = sum(term in combined for term in positive_terms)
-    if hit_count >= 3:
-        return 1.25
-    if hit_count == 2:
-        return 1.15
-    if hit_count == 1:
-        return 1.08
-    return 1.0
-
-
-def legal_type_priority_factor(chunk: Dict[str, Any]) -> float:
-    combined = normalize_text(
-        f"{chunk.get('title', '')} {chunk.get('legal_type', '')} {chunk.get('document_number', '')}"
-    )
-
-    if "van ban hop nhat" in combined and "luat dat dai" in combined:
-        return 1.18
-    if "luat dat dai" in combined:
-        return 1.20
-    if "nghi dinh" in combined:
-        return 1.08
-    if "thong tu" in combined:
-        return 1.00
-    if "cong van" in combined:
-        return 0.55
-    if "du an" in combined or "ke hoach" in combined or "vilg" in combined:
-        return 0.55
-    if "quyet dinh" in combined:
-        return 0.75
-    return 1.0
+        return self.search(query, top_n=top_k)
 
 
 _default_retriever: Optional[BM25Retriever] = None
@@ -691,7 +450,7 @@ def get_default_retriever() -> BM25Retriever:
 
 
 def bm25_search(query: str, top_k: int = 100) -> List[Dict[str, Any]]:
-    return get_default_retriever().search(query, top_n=top_k, expand_query=True)
+    return get_default_retriever().search(query, top_n=top_k)
 
 
 if __name__ == "__main__":
