@@ -1,11 +1,16 @@
-import faiss
-import pickle
+from __future__ import annotations
+
 import json
+import pickle
+from copy import deepcopy
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+import faiss
 import numpy as np
 import torch
 import torch.nn.functional as F
 from transformers import AutoModel, AutoTokenizer
-from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 VECTOR_STORE_DIR = PROJECT_ROOT / "data" / "vector_store"
@@ -13,66 +18,116 @@ MODEL_NAME = "BAAI/bge-m3"
 MAX_SEQ_LEN = 512
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-# Load config
-with open(f"{VECTOR_STORE_DIR}/config.json") as f:
-    config = json.load(f)
-print(f"Config: {config}")
 
-# Load index
-index = faiss.read_index(f"{VECTOR_STORE_DIR}/faiss_index.bin")
-print(f"Index size: {index.ntotal} vectors, dimension: {index.d}")
+class VectorRetriever:
+    """FAISS vector retriever for legal chunks."""
 
-# Load metadata
-with open(f"{VECTOR_STORE_DIR}/metadata.pkl", "rb") as f:
-    data = pickle.load(f)
-chunk_ids = data["chunk_ids"]
-metadata = data["metadata"]
-print(f"Metadata: {len(chunk_ids)} entries")
+    def __init__(
+        self,
+        vector_store_dir: Path = VECTOR_STORE_DIR,
+        model_name: str = MODEL_NAME,
+        max_seq_len: int = MAX_SEQ_LEN,
+        device: Optional[str] = None,
+    ):
+        self.vector_store_dir = Path(vector_store_dir)
+        self.model_name = model_name
+        self.max_seq_len = max_seq_len
+        self.device = device or DEVICE
 
-# Basic sanity checks
-assert index.ntotal == config["num_vectors"], "Vector count mismatch!"
-assert index.d == config["dim"], "Dimension mismatch!"
-assert len(chunk_ids) == len(metadata), "Metadata length mismatch!"
-print("All basic checks passed!\n")
+        with open(self.vector_store_dir / "config.json", encoding="utf-8") as f:
+            self.config = json.load(f)
 
-# Test query
-tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-model = AutoModel.from_pretrained(MODEL_NAME, attn_implementation="sdpa", dtype=torch.float16 if DEVICE == "cuda" else torch.float32)
-model.to(DEVICE)
-model.eval()
+        self.index = faiss.read_index(str(self.vector_store_dir / "faiss_index.bin"))
 
-def embed_text(text):
-    inputs = tokenizer(text, padding=True, truncation=True, max_length=MAX_SEQ_LEN, return_tensors="pt").to(DEVICE)
-    with torch.inference_mode():
-        outputs = model(**inputs)
-        emb = outputs.last_hidden_state[:, 0]
-        emb = F.normalize(emb, p=2, dim=1)
-    return emb.cpu().numpy().astype(np.float32)
+        with open(self.vector_store_dir / "metadata.pkl", "rb") as f:
+            data = pickle.load(f)
+        self.chunk_ids = data["chunk_ids"]
+        self.metadata = data["metadata"]
 
-test_queries = [
-    "Đất không sở hữu có được cấp sổ đỏ không?",
-    "Tranh chấp đất đai giải quyết như thế nào?",
-    "Điều kiện để được cấp sổ đỏ là gì?",          
-]
+        self._validate_store()
+        self.tokenizer = None
+        self.model = None
 
-for query in test_queries:
-    emb = embed_text(query)
-    scores, indices = index.search(emb, k=5)
+    def _validate_store(self) -> None:
+        if self.index.ntotal != self.config["num_vectors"]:
+            raise ValueError("Vector count mismatch!")
+        if self.index.d != self.config["dim"]:
+            raise ValueError("Dimension mismatch!")
+        if len(self.chunk_ids) != len(self.metadata):
+            raise ValueError("Metadata length mismatch!")
 
-    print(f"Query: {query}")
-    for rank, (idx, score) in enumerate(zip(indices[0], scores[0])):
-        meta = metadata[idx]
-        title = meta.get("title", "N/A")
-        doc_num = meta.get("document_number", "N/A")
-        art = meta.get("article", "")
-        clause = meta.get("clause", "")
-        point = meta.get("point", "")
-        location = f"Điều {art}" + (f", Khoản {clause}" if clause else "") + (f", Điểm {point}" if point else "")
-        content_preview = meta.get("content", "")[:150] if "content" in meta else ""
-        print(f"  {rank+1}. [{doc_num}] {title}")
-        print(f"     {location} — score: {score:.4f}")
-        if content_preview:
-            print(f"     Preview: {content_preview}...")
-    print()
+    def _load_model(self) -> None:
+        if self.tokenizer is not None and self.model is not None:
+            return
 
-print("Vector store is working correctly!")
+        self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
+        dtype = torch.float16 if self.device == "cuda" else torch.float32
+        self.model = AutoModel.from_pretrained(
+            self.model_name,
+            attn_implementation="sdpa",
+            dtype=dtype,
+        )
+        self.model.to(self.device)
+        self.model.eval()
+
+    def embed_text(self, text: str) -> np.ndarray:
+        self._load_model()
+        inputs = self.tokenizer(
+            text,
+            padding=True,
+            truncation=True,
+            max_length=self.max_seq_len,
+            return_tensors="pt",
+        ).to(self.device)
+
+        with torch.inference_mode():
+            outputs = self.model(**inputs)
+            emb = outputs.last_hidden_state[:, 0]
+            emb = F.normalize(emb, p=2, dim=1)
+
+        return emb.cpu().numpy().astype(np.float32)
+
+    def search(self, query: str, top_k: int = 100) -> List[Dict[str, Any]]:
+        if top_k <= 0:
+            return []
+
+        emb = self.embed_text(query)
+        scores, indices = self.index.search(emb, k=min(top_k, self.index.ntotal))
+
+        results = []
+        for rank, (idx, score) in enumerate(zip(indices[0], scores[0]), start=1):
+            if idx < 0:
+                continue
+
+            item = deepcopy(self.metadata[int(idx)])
+            item.setdefault("chunk_id", self.chunk_ids[int(idx)])
+            item["rank"] = rank
+            item["vector_score"] = float(score)
+            item["score"] = float(score)
+            item["source"] = "vector"
+            results.append(item)
+
+        return results
+
+    def __call__(self, query: str, top_k: int = 100) -> List[Dict[str, Any]]:
+        return self.search(query, top_k=top_k)
+
+
+_default_retriever: Optional[VectorRetriever] = None
+
+
+def get_default_retriever() -> VectorRetriever:
+    global _default_retriever
+    if _default_retriever is None:
+        _default_retriever = VectorRetriever()
+    return _default_retriever
+
+
+def vector_search(query: str, top_k: int = 100) -> List[Dict[str, Any]]:
+    return get_default_retriever().search(query, top_k=top_k)
+
+
+if __name__ == "__main__":
+    retriever = get_default_retriever()
+    print(f"Index size: {retriever.index.ntotal} vectors, dimension: {retriever.index.d}")
+    print(f"Metadata: {len(retriever.chunk_ids)} entries")
