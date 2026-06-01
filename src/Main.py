@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import argparse
+import contextlib
+import io
 import time
 from typing import Any, Dict, Sequence
 
@@ -9,50 +12,40 @@ from Searcher.HybridSearch import hybrid_search
 TRIAL_QUERY = "Quy định về thu hồi đất và xử lý quyền lợi, nghĩa vụ của người sử dụng đất khi Nhà nước thu hồi đất là gì?"
 
 
-def safe_preview(value: Any, limit: int = 260) -> str:
-    text = "" if value is None else str(value)
-    text = " ".join(text.split())
-    if len(text) <= limit:
-        return text
-    return text[: limit - 3] + "..."
-
-
-def format_score(value, digits=4):
+def clean_text(value: Any) -> str:
     if value is None:
-        return "N/A"
-    try:
-        return f"{float(value):.{digits}f}"
-    except (TypeError, ValueError):
-        return "N/A"
+        return ""
+    return " ".join(str(value).split())
 
 
 def print_results(results: Sequence[Dict[str, Any]]) -> None:
+    print("Sources")
+    print("=" * 100)
     for result in results:
         print("-" * 100)
-        print(f"Rank: {result.get('rank')}")
         print(f"Chunk ID: {result.get('chunk_id')}")
-        print(f"Fused score: {format_score(result.get('score', 0.0))}")
-        print(f"BM25 raw: {format_score(result.get('bm25_raw_score'))}")
-        print(f"BM25 rank: {result.get('bm25_rank')}")
-        print(f"Vector raw: {format_score(result.get('vector_raw_score'))}")
-        print(f"Vector rank: {result.get('vector_rank')}")
-        print(f"RRF: {format_score(result.get('fusion_score', result.get('final_score', 0.0)))}")        
-        print(f"Title: {safe_preview(result.get('title'), 180)}")
-        print(f"Content: {safe_preview(result.get('content'))}")
+        print(f"Content: {clean_text(result.get('content'))}")
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Run LandBot retrieval.")
+    parser.add_argument("--query", default=TRIAL_QUERY, help="Question to answer.")
+    parser.add_argument("--top-k", type=int, default=5, help="Number of retrieval sources.")
+    parser.add_argument("--alpha", type=float, default=0.4, help="Hybrid vector weight.")
+    parser.add_argument("--rrf-k", type=int, default=60, help="RRF rank smoothing constant.")
+    return parser.parse_args()
 
 
 def main() -> None:
-    print("Trial query:")
-    print(TRIAL_QUERY)
-    print()
+    args = parse_args()
 
     start = time.time()
-    results = hybrid_search(TRIAL_QUERY, top_k=5, alpha=0.4)
-    
-    runtime = time.time() - start
+    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+        results = hybrid_search(args.query, top_k=args.top_k, alpha=args.alpha, rrf_k=args.rrf_k)
+    loading_time = time.time() - start
 
-    print(f"Runtime: {runtime:.2f} seconds")
-    print(f"Result count: {len(results)}")
+    print(f"Loading time: {loading_time:.2f} seconds")
+    print()
     print_results(results)
 
 

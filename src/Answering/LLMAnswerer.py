@@ -49,6 +49,7 @@ class LLMConfig:
     temperature: float = 0.2
     top_p: float = 0.9
     device_map: str = "auto"
+    verbose: bool = False
 
 
 def safe_text(value: Any) -> str:
@@ -95,7 +96,6 @@ def format_sources(results: Sequence[Dict[str, Any]], max_chars: int) -> str:
             f"document_number: {safe_text(result.get('document_number'))}",
             f"legal_type: {safe_text(result.get('legal_type'))}",
             f"title: {title}",
-            f"score: {float(result.get('score', 0.0)):.4f}",
             f"content: {content}",
         ])
 
@@ -138,9 +138,10 @@ class QwenAnswerGenerator:
         if self.tokenizer is not None and self.model is not None:
             return
 
-        print(f"Loading answer model: {self.model_name}")
-        print(f"Quantization option: {self.config.quantization}")
-        print(f"Local files only: {self.config.local_files_only}")
+        if self.config.verbose:
+            print(f"Loading answer model: {self.model_name}")
+            print(f"Quantization option: {self.config.quantization}")
+            print(f"Local files only: {self.config.local_files_only}")
 
         self.tokenizer = AutoTokenizer.from_pretrained(
             self.model_name,
